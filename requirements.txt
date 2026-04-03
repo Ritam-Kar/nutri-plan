@@ -1,0 +1,7 @@
+google-adk>=1.0.0
+google-generativeai
+uvicorn
+mcp
+httpx
+google-maps-mcp-server
+google-calendar-mcp
