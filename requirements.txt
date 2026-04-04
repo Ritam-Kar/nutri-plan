@@ -3,5 +3,4 @@ google-generativeai
 uvicorn
 mcp
 httpx
-google-maps-mcp-server
 cryptography

@@ -1,6 +1,7 @@
 import os
 import sys
 import smtplib
+import httpx
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from google.adk.agents import LlmAgent, SequentialAgent
@@ -14,7 +15,7 @@ os.environ["GOOGLE_CLOUD_LOCATION"] = "us-central1"
 
 MODEL = "gemini-2.5-flash"
 
-# --- MCP Toolsets ---
+# --- Nutrition MCP (custom server, works fine) ---
 
 nutrition_tools = MCPToolset(
     connection_params=StdioServerParameters(
@@ -23,12 +24,86 @@ nutrition_tools = MCPToolset(
     )
 )
 
-maps_tools = MCPToolset(
-    connection_params=StdioServerParameters(
-        command="google-maps-mcp-server",
-        env={"GOOGLE_MAPS_API_KEY": os.environ.get("GOOGLE_MAPS_API_KEY", "")}
-    )
-)
+# --- Maps Function Tools (direct API calls, no subprocess) ---
+
+async def search_nearby_stores(location: str, radius_meters: int = 5000) -> dict:
+    """
+    Search for nearby grocery stores and supermarkets.
+    Args:
+        location: Area or neighbourhood to search near
+        radius_meters: Search radius in meters (default 5000)
+    """
+    try:
+        api_key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+        if not api_key:
+            return {"success": False, "error": "Maps API key not configured"}
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # First geocode the location
+            geo_resp = await client.get(
+                "https://maps.googleapis.com/maps/api/geocode/json",
+                params={"address": location, "key": api_key}
+            )
+            geo_data = geo_resp.json()
+
+            if geo_data.get("status") != "OK":
+                return {"success": False, "error": f"Geocoding failed: {geo_data.get('status')}"}
+
+            loc = geo_data["results"][0]["geometry"]["location"]
+            lat, lng = loc["lat"], loc["lng"]
+
+            # Search for nearby stores
+            places_resp = await client.get(
+                "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+                params={
+                    "location": f"{lat},{lng}",
+                    "radius": radius_meters,
+                    "type": "supermarket",
+                    "key": api_key
+                }
+            )
+            places_data = places_resp.json()
+
+            stores = []
+            for place in places_data.get("results", [])[:3]:
+                stores.append({
+                    "name": place.get("name"),
+                    "address": place.get("vicinity"),
+                    "rating": place.get("rating"),
+                    "lat": place["geometry"]["location"]["lat"],
+                    "lng": place["geometry"]["location"]["lng"]
+                })
+
+            if not stores:
+                return {"success": False, "error": "No stores found"}
+
+            # Get distances
+            destinations = "|".join([f"{s['lat']},{s['lng']}" for s in stores])
+            dist_resp = await client.get(
+                "https://maps.googleapis.com/maps/api/distancematrix/json",
+                params={
+                    "origins": f"{lat},{lng}",
+                    "destinations": destinations,
+                    "key": api_key
+                }
+            )
+            dist_data = dist_resp.json()
+
+            elements = dist_data.get("rows", [{}])[0].get("elements", [])
+            for i, store in enumerate(stores):
+                if i < len(elements) and elements[i].get("status") == "OK":
+                    store["distance"] = elements[i]["distance"]["text"]
+                    store["duration"] = elements[i]["duration"]["text"]
+                else:
+                    store["distance"] = "N/A"
+                    store["duration"] = "N/A"
+
+            return {"success": True, "stores": stores}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+maps_search_tool = FunctionTool(search_nearby_stores)
 
 # --- Email Function Tool ---
 
@@ -162,7 +237,7 @@ recipe_nutrition_agent = LlmAgent(
     Meal plan is in session state as 'meal_plan'.
     Use get_nutrition for 3-4 key ingredients to verify estimates.
     If MCP returns no data use your own knowledge.
-    Output ONLY: "ok" — nothing else. The meal plan already has nutrition inline."""
+    Output ONLY: "ok" — nothing else."""
 )
 
 grocery_agent = LlmAgent(
@@ -180,27 +255,21 @@ grocery_agent = LlmAgent(
     VEGETABLES
       Onion           2 kg       ₹80
       Tomato          2 kg       ₹60
-      [continue all items]
       Subtotal  ₹XXX
 
     DAIRY
-      [items]
       Subtotal  ₹XXX
 
     GRAINS & CEREALS
-      [items]
       Subtotal  ₹XXX
 
     PULSES & LEGUMES
-      [items]
       Subtotal  ₹XXX
 
     SPICES & CONDIMENTS
-      [items]
       Subtotal  ₹XXX
 
     OTHER
-      [items]
       Subtotal  ₹XXX
 
     TOTAL ESTIMATED COST  ₹XXXX
@@ -212,22 +281,19 @@ storefinder_agent = LlmAgent(
     name="storefinder_agent",
     model=MODEL,
     output_key="store_results",
-    tools=[maps_tools],
+    tools=[maps_search_tool],
     instruction="""You are the final presenter for NutriPlan.
     Read from session state:
     - 'user_profile' for location
     - 'meal_plan' for the full 7-day plan
     - 'grocery_list' for shopping items
 
-    Use search_places to find 3 nearby supermarkets.
-    Use calculate_distance_matrix for travel times.
-    If maps tools fail or return no results, use your knowledge of
+    Use search_nearby_stores with the user's location from user_profile.
+    If the tool returns no results or fails, use your knowledge of
     well-known stores in that area and mark distances as approximate.
 
-    Output the COMPLETE final response in clean plain text — NO boxes,
-    NO horizontal lines, NO special border characters.
-    Just emojis, headings, and content. Like this:
-
+    Output the COMPLETE final response in clean plain text — no boxes,
+    no horizontal lines, no special border characters.
 
     🥗 NUTRIPLAN — YOUR WEEKLY PLAN
 
@@ -235,8 +301,8 @@ storefinder_agent = LlmAgent(
     📅 7-DAY MEAL PLAN WITH NUTRITION
 
     [Copy the COMPLETE meal plan from session state 'meal_plan' here
-     exactly as formatted — all 7 days, per-meal nutrition with a hyphen
-     after Breakfast / Lunch / Dinner, day totals, and weekly summary]
+     exactly as formatted — all 7 days with per-meal nutrition,
+     day totals, and weekly summary]
 
 
     🛒 GROCERY LIST
@@ -249,15 +315,15 @@ storefinder_agent = LlmAgent(
 
     1.  [Store Name]
         [Address]
-        [X km away]   [X mins drive]
+        [Distance]   [Travel time]
 
     2.  [Store Name]
         [Address]
-        [X km away]   [X mins drive]
+        [Distance]   [Travel time]
 
     3.  [Store Name]
         [Address]
-        [X km away]   [X mins drive]
+        [Distance]   [Travel time]
 
 
     📧 Want me to email this plan to you? Just share your email address!"""
